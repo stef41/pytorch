@@ -695,7 +695,6 @@ constant int32_t kPaddingZeros = 0;
 constant int32_t kPaddingBorder = 1;
 constant int32_t kPaddingReflection = 2;
 
-// Original version from working branch - uses pointer for grad_in
 // Uses opmath_t<T> for intermediate computations to avoid overflow with
 // half/bfloat
 template <typename T>
@@ -884,7 +883,6 @@ static void add_value_bounded_2d(
   }
 }
 
-// 3D backward kernel for grad_input - matches original working version exactly
 template <typename T>
 kernel void grid_sampler_3d_backward_input(
     constant T* grad_output [[buffer(0)]],
@@ -1165,7 +1163,6 @@ kernel void grid_sampler_3d_backward_input(
   }
 }
 
-// 3D backward kernel for grad_grid - matches original working version
 template <typename T>
 kernel void grid_sampler_3d_backward_grid(
     constant T* grad_output [[buffer(0)]],
@@ -1387,7 +1384,6 @@ kernel void grid_sampler_3d_backward_grid(
       static_cast<T>(giz_mult * giz);
 }
 
-// 2D backward kernel for grad_input
 template <typename T>
 kernel void grid_sampler_2d_backward_input(
     constant T* grad_output [[buffer(0)]],
@@ -1607,7 +1603,6 @@ kernel void grid_sampler_2d_backward_input(
   }
 }
 
-// 2D backward kernel for grad_grid
 template <typename T>
 kernel void grid_sampler_2d_backward_grid(
     constant T* grad_output [[buffer(0)]],
