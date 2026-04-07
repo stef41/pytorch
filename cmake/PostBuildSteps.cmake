@@ -28,3 +28,18 @@ add_custom_target(merge_compile_commands ALL
   COMMENT "Merging compile_commands.json..."
   VERBATIM
 )
+
+# --- License concatenation ---
+# Build the bundled license file for wheel distribution.
+add_custom_target(bundle_licenses ALL
+  COMMAND "${Python_EXECUTABLE}"
+    "${PROJECT_SOURCE_DIR}/tools/bundle_licenses.py"
+    "${PROJECT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/LICENSES_BUNDLED.txt"
+  COMMENT "Generating bundled license file..."
+  VERBATIM
+)
+install(FILES "${CMAKE_BINARY_DIR}/LICENSES_BUNDLED.txt"
+  DESTINATION "."
+  RENAME "LICENSE"
+  OPTIONAL
+)
