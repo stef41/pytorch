@@ -1747,3 +1747,71 @@ def grid_sampler_backward_strategy(
 ) -> list[list[Placement | _ShardingPlaceholder]]:
     # grid_sampler_{2,3}d_backward: 2 outputs (grad_input, grad_grid) + 3 inputs = 5 placements, batch-only
     return [[_ShardingPlaceholder(0)] * 5]
+
+
+# ---------------------------------------------------------------------------
+# Normalization ops
+#
+# Batch norm reduces over batch (dim 0) + spatial dims (2+), keeping only
+# channel (dim 1).  Neither batch nor channel sharding is safe, so we fall
+# back to replicate-only.
+#
+# Group norm reduces over (C/groups, spatial) within each group per sample.
+# Batch dim (0) is safe to shard — each sample is independent.
+# ---------------------------------------------------------------------------
+
+BATCH_NORM_3OUT_OPS = [
+    aten.native_batch_norm.default,
+    aten._native_batch_norm_legit.default,
+    aten._native_batch_norm_legit.no_stats,
+    aten._native_batch_norm_legit_no_training.default,
+]
+
+BATCH_NORM_4OUT_OPS = [
+    aten._batch_norm_with_update.default,
+]
+
+
+@register_single_dim_strategy(
+    BATCH_NORM_3OUT_OPS + BATCH_NORM_4OUT_OPS,
+    schema_info=RuntimeSchemaInfo(1),
+)
+def batch_norm_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # Batch norm normalizes per-channel (reduces over batch + spatial dims),
+    # so channel-dim sharding is valid: each shard processes independent channels.
+    # Unlike group_norm, batch_norm infers shapes from tensors (no scalar N/C/HxW).
+    num_outputs = 4 if op in BATCH_NORM_4OUT_OPS else 3
+    num_tensor_inputs = sum(isinstance(a, TensorMeta) for a in args_schema)
+    # output [N,C,*] shards on dim 1; save_mean, save_invstd [C] shard on dim 0
+    rule: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(1)]
+    rule.extend([_ShardingPlaceholder(0)] * 2)  # save_mean, save_invstd
+    if num_outputs == 4:
+        rule.append(Replicate())  # reserve: opaque cuDNN workspace
+    # input [N,C,*] shards on dim 1; weight, bias, running_mean, running_var [C] on dim 0
+    rule.append(_ShardingPlaceholder(1))  # input
+    rule.extend([_ShardingPlaceholder(0)] * (num_tensor_inputs - 1))
+    return [rule]
+
+
+@register_single_dim_strategy(
+    [aten.native_group_norm.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def group_norm_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # native_group_norm(input, weight?, bias?, N, C, HxW, group, eps) -> (out, mean, rstd)
+    # Batch dim (0) is independent. The scalar N/C/HxW args are adjusted to local
+    # values by _adjust_group_norm_scalars in the sharding propagation layer.
+    num_tensor_inputs = sum(isinstance(a, TensorMeta) for a in args_schema)
+    # 3 outputs + input all shard on batch dim
+    placements: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(0)] * 4
+    # weight and bias (if present) must be Replicate
+    placements.extend([Replicate()] * (num_tensor_inputs - 1))
+    return [placements]
