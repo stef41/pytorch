@@ -3295,6 +3295,24 @@ class GraphModule(torch.nn.Module):
             torch._C._functorch.get_inplace_requires_grad_allowed(), prev_inplace
         )
 
+    @parametrize("gb", (True, False))
+    def test_functorch_low_level_jvp(self, gb):
+        def f(x, gb):
+            level = torch._C._functorch._jvp_increment_nesting()
+            if gb:
+                torch._dynamo.graph_break()
+            depth = torch._C._functorch.get_dynamic_layer_stack_depth()
+            torch._C._functorch._jvp_decrement_nesting()
+            return x + level + depth
+
+        prev_level = torch._C._functorch.maybe_current_level()
+        opt_f = torch.compile(f, fullgraph=not gb, backend="eager")
+        x = torch.randn(3, 3)
+        opt_y = opt_f(x, gb)
+        y = f(x, gb)
+        self.assertEqual(y, opt_y)
+        self.assertEqual(torch._C._functorch.maybe_current_level(), prev_level)
+
     def test_retrace_grad(self):
         # Recompile trick doesn't work with dynamic shapes
         if check_dynamic_shape_capture():
@@ -3343,6 +3361,503 @@ class GraphModule(torch.nn.Module):
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
         _saved_tensors_hooks_enable = torch._C._autograd._saved_tensors_hooks_enable();  _saved_tensors_hooks_enable = None
         return (grad_input_1,)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_functorch_get_dynamic_layer_stack_depth(self):
+        def f(x=None):
+            l = torch._C._functorch.get_dynamic_layer_stack_depth()
+            if x is not None:
+                return x + l
+            else:
+                return l
+
+        prev_dynamic_layer_stack_depth = (
+            torch._C._functorch.get_dynamic_layer_stack_depth()
+        )
+        opt_f = torch.compile(f, backend="eager", fullgraph=True)
+        N = 3
+        x = torch.randn(3, 3)
+        try:
+            for _ in range(N):
+                out = f()
+                opt_out = opt_f()
+                self.assertEqual(out, opt_out)
+
+                out = f(x)
+                opt_out = opt_f(x)
+                self.assertEqual(out, opt_out)
+                torch._C._functorch._grad_increment_nesting()
+        finally:
+            torch._C._functorch.pop_dynamic_layer_stack_and_undo_to_depth(
+                prev_dynamic_layer_stack_depth
+            )
+
+    def test_retrace_hessian(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin().sum()
+
+        def wrapper_fn(x):
+            return torch.func.hessian(fn)(x)
+
+        x = torch.randn(3, 3)
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y = wrapper_fn(x)
+        opt_y = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[3, 3]"):
+        l_x_ = L_x_
+
+        tensor: "i64[1]" = torch.tensor((9,))
+        cumsum: "i64[1]" = tensor.cumsum(dim = 0);  tensor = None
+        getitem: "i64[0]" = cumsum[slice(None, -1, None)];  cumsum = None
+        neg: "i64[0]" = getitem.neg();  getitem = None
+        unbind = neg.unbind();  neg = unbind = None
+
+        chunk: "f32[9, 9]" = l_x_.new_zeros(9, 9)
+
+        diagonal: "f32[9]" = chunk.diagonal(0)
+        fill_: "f32[9]" = diagonal.fill_(1);  diagonal = fill_ = None
+
+        child: "f32[9, 3, 3]" = chunk.view(9, 3, 3);  chunk = None
+
+        lazy_load_decompositions = torch._functorch.predispatch.lazy_load_decompositions();  lazy_load_decompositions = None
+
+        _vmap_increment_nesting = torch._functorch.predispatch._vmap_increment_nesting(9, 'error');  _vmap_increment_nesting = None
+
+        child_1: "f32[3, 3]" = torch._functorch.predispatch._add_batch_dim(child, 0, 1);  child = None
+
+        _jvp_increment_nesting = torch._C._functorch._jvp_increment_nesting();  _jvp_increment_nesting = None
+        _set_fwd_grad_enabled = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled = None
+        _enter_dual_level = torch._C._enter_dual_level();  _enter_dual_level = None
+
+        _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
+
+        child_2: "f32[3, 3]" = torch._make_dual(l_x_, child_1, level = 0);  child_1 = None
+
+        _wrap_for_grad: "f32[3, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
+
+        _saved_tensors_hooks_disable = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable = None
+        _grad_increment_nesting = torch._C._functorch._grad_increment_nesting();  _grad_increment_nesting = None
+
+        diff_primals: "f32[3, 3]" = torch._C._functorch._wrap_for_grad(child_2, 3);  child_2 = None
+
+        set_inplace_requires_grad_allowed = torch._C._functorch.set_inplace_requires_grad_allowed(True);  set_inplace_requires_grad_allowed = None
+
+        _set_tensor_requires_grad: "f32[3, 3]" = torch._functorch.eager_transforms._set_tensor_requires_grad(diff_primals);  _set_tensor_requires_grad = None
+
+        set_inplace_requires_grad_allowed_1 = torch._C._functorch.set_inplace_requires_grad_allowed(False);  set_inplace_requires_grad_allowed_1 = None
+
+        sin: "f32[3, 3]" = diff_primals.sin()
+        primals_out: "f32[]" = sin.sum();  sin = None
+
+        results: "f32[]" = torch._C._functorch._unwrap_for_grad(primals_out, 3)
+
+        _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
+        _saved_tensors_hooks_enable = torch._C._autograd._saved_tensors_hooks_enable();  _saved_tensors_hooks_enable = None
+
+        tensor_1: "i64[1]" = torch.tensor((1,))
+        cumsum_1: "i64[1]" = tensor_1.cumsum(dim = 0);  tensor_1 = None
+        getitem_1: "i64[0]" = cumsum_1[slice(None, -1, None)];  cumsum_1 = None
+        neg_1: "i64[0]" = getitem_1.neg();  getitem_1 = None
+        unbind_1 = neg_1.unbind();  neg_1 = unbind_1 = None
+
+        chunk_1: "f32[1, 1]" = results.new_zeros(1, 1);  results = None
+
+        diagonal_1: "f32[1]" = chunk_1.diagonal(0)
+        fill__1: "f32[1]" = diagonal_1.fill_(1);  diagonal_1 = fill__1 = None
+
+        basis: "f32[1]" = chunk_1.view(1);  chunk_1 = None
+
+        lazy_load_decompositions_1 = torch._functorch.predispatch.lazy_load_decompositions();  lazy_load_decompositions_1 = None
+
+        _vmap_increment_nesting_1 = torch._functorch.predispatch._vmap_increment_nesting(1, 'error');  _vmap_increment_nesting_1 = None
+
+        _add_batch_dim_1: "f32[]" = torch._functorch.predispatch._add_batch_dim(basis, 0, 3);  basis = None
+
+        _autograd_grad = torch._functorch.eager_transforms._autograd_grad([primals_out], [diff_primals], [_add_batch_dim_1], retain_graph = True, create_graph = True);  primals_out = diff_primals = _add_batch_dim_1 = None
+        batched_outputs: "f32[3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
+        chunked_result: "f32[1, 3, 3]" = torch._functorch.predispatch._remove_batch_dim(batched_outputs, 3, 1, 0);  batched_outputs = None
+
+        _vmap_decrement_nesting = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting = None
+
+        split = chunked_result.split((1,), dim = 0);  chunked_result = None
+        split_1: "f32[1, 3, 3]" = split[0];  split = None
+
+        output_input: "f32[3, 3]" = split_1.view((3, 3));  split_1 = None
+
+        _unpack_dual = torch._unpack_dual(output_input, level = 0);  output_input = None
+        primal: "f32[3, 3]" = _unpack_dual[0]
+        dual: "f32[3, 3]" = _unpack_dual[1];  _unpack_dual = None
+
+        primals_out_unflatten: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(primal, 2);  primal = primals_out_unflatten = None
+        tangents_out_unflatten: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(dual, 2);  dual = None
+
+        _exit_dual_level = torch._C._exit_dual_level(0);  _exit_dual_level = None
+        _set_fwd_grad_enabled_1 = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled_1 = None
+        _jvp_decrement_nesting = torch._C._functorch._jvp_decrement_nesting();  _jvp_decrement_nesting = None
+
+        results_1: "f32[9, 3, 3]" = torch._functorch.predispatch._remove_batch_dim(tangents_out_unflatten, 1, 9, 0);  tangents_out_unflatten = None
+
+        _vmap_decrement_nesting_1 = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting_1 = None
+
+        movedim: "f32[3, 3, 9]" = results_1.movedim(0, -1);  results_1 = None
+        split_2 = movedim.split((9,), dim = -1);  movedim = None
+        jac_out_in: "f32[3, 3, 9]" = split_2[0];  split_2 = None
+
+        unflatten: "f32[3, 3, 3, 3]" = jac_out_in.unflatten(-1, (3, 3));  jac_out_in = None
+        return (unflatten,)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_retrace_vmap(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin()
+
+        def wrapper_fn(x):
+            return torch.func.vmap(fn)(x)
+
+        x = torch.randn(3, 3)
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y = wrapper_fn(x)
+        opt_y = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[3, 3]"):
+        l_x_ = L_x_
+
+        lazy_load_decompositions = torch._functorch.predispatch.lazy_load_decompositions();  lazy_load_decompositions = None
+
+        _vmap_increment_nesting = torch._functorch.predispatch._vmap_increment_nesting(3, 'error');  _vmap_increment_nesting = None
+
+        _add_batch_dim: "f32[3]" = torch._functorch.predispatch._add_batch_dim(l_x_, 0, 1);  l_x_ = None
+
+        batched_outputs: "f32[3]" = _add_batch_dim.sin();  _add_batch_dim = None
+
+        _remove_batch_dim: "f32[3, 3]" = torch._functorch.predispatch._remove_batch_dim(batched_outputs, 1, 3, 0);  batched_outputs = None
+
+        _vmap_decrement_nesting = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting = None
+        return (_remove_batch_dim,)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_retrace_vjp(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin()
+
+        def wrapper_fn(x):
+            return torch.func.vjp(fn, x)
+
+        x = torch.randn(3, 3)
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y, _ = wrapper_fn(x)
+        opt_y, _ = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[3, 3]"):
+        l_x_ = L_x_
+
+        _saved_tensors_hooks_disable = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable = None
+        _grad_increment_nesting = torch._C._functorch._grad_increment_nesting();  _grad_increment_nesting = None
+
+        _wrap_for_grad: "f32[3, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 1);  l_x_ = None
+
+        set_inplace_requires_grad_allowed = torch._C._functorch.set_inplace_requires_grad_allowed(True);  set_inplace_requires_grad_allowed = None
+
+        child: "f32[3, 3]" = torch._functorch.eager_transforms._set_tensor_requires_grad(_wrap_for_grad)
+
+        set_inplace_requires_grad_allowed_1 = torch._C._functorch.set_inplace_requires_grad_allowed(False);  set_inplace_requires_grad_allowed_1 = None
+
+        primals_out: "f32[3, 3]" = _wrap_for_grad.sin();  _wrap_for_grad = None
+
+        results: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(primals_out, 1)
+
+        _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
+        _saved_tensors_hooks_enable = torch._C._autograd._saved_tensors_hooks_enable();  _saved_tensors_hooks_enable = None
+        return (results, child, primals_out)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_retrace_jvp(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin()
+
+        def wrapper_fn(x):
+            return torch.func.jvp(fn, (x,), (x,))
+
+        x = torch.randn([])
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y, _ = wrapper_fn(x)
+        opt_y, _ = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[]"):
+        l_x_ = L_x_
+
+        _jvp_increment_nesting = torch._C._functorch._jvp_increment_nesting();  _jvp_increment_nesting = None
+        _set_fwd_grad_enabled = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled = None
+        _enter_dual_level = torch._C._enter_dual_level();  _enter_dual_level = None
+
+        _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
+
+        _make_dual: "f32[]" = torch._make_dual(l_x_, l_x_, level = 0);  l_x_ = None
+
+        result_duals: "f32[]" = _make_dual.sin();  _make_dual = None
+
+        _unpack_dual = torch._unpack_dual(result_duals, level = 0);  result_duals = None
+        primal: "f32[]" = _unpack_dual[0]
+        dual: "f32[]" = _unpack_dual[1];  _unpack_dual = None
+
+        primals_out_unflatten: "f32[]" = torch._C._functorch._unwrap_for_grad(primal, 1);  primal = None
+        tangents_out_unflatten: "f32[]" = torch._C._functorch._unwrap_for_grad(dual, 1);  dual = None
+
+        _exit_dual_level = torch._C._exit_dual_level(0);  _exit_dual_level = None
+        _set_fwd_grad_enabled_1 = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled_1 = None
+        _jvp_decrement_nesting = torch._C._functorch._jvp_decrement_nesting();  _jvp_decrement_nesting = None
+        return (primals_out_unflatten, tangents_out_unflatten)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_retrace_jacrev(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin()
+
+        def wrapper_fn(x):
+            return torch.func.jacrev(fn)(x)
+
+        x = torch.randn(3, 3)
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y = wrapper_fn(x)
+        opt_y = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[3, 3]"):
+        l_x_ = L_x_
+
+        _saved_tensors_hooks_disable = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable = None
+        _grad_increment_nesting = torch._C._functorch._grad_increment_nesting();  _grad_increment_nesting = None
+
+        diff_primals: "f32[3, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 1);  l_x_ = None
+
+        set_inplace_requires_grad_allowed = torch._C._functorch.set_inplace_requires_grad_allowed(True);  set_inplace_requires_grad_allowed = None
+
+        _set_tensor_requires_grad: "f32[3, 3]" = torch._functorch.eager_transforms._set_tensor_requires_grad(diff_primals);  _set_tensor_requires_grad = None
+
+        set_inplace_requires_grad_allowed_1 = torch._C._functorch.set_inplace_requires_grad_allowed(False);  set_inplace_requires_grad_allowed_1 = None
+
+        primals_out: "f32[3, 3]" = diff_primals.sin()
+
+        results: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(primals_out, 1)
+
+        _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
+        _saved_tensors_hooks_enable = torch._C._autograd._saved_tensors_hooks_enable();  _saved_tensors_hooks_enable = None
+
+        tensor: "i64[1]" = torch.tensor((9,))
+        cumsum: "i64[1]" = tensor.cumsum(dim = 0);  tensor = None
+        getitem: "i64[0]" = cumsum[slice(None, -1, None)];  cumsum = None
+        neg: "i64[0]" = getitem.neg();  getitem = None
+        unbind = neg.unbind();  neg = unbind = None
+
+        chunk: "f32[9, 9]" = results.new_zeros(9, 9);  results = None
+
+        diagonal: "f32[9]" = chunk.diagonal(0)
+        fill_: "f32[9]" = diagonal.fill_(1);  diagonal = fill_ = None
+
+        basis: "f32[9, 3, 3]" = chunk.view(9, 3, 3);  chunk = None
+
+        lazy_load_decompositions = torch._functorch.predispatch.lazy_load_decompositions();  lazy_load_decompositions = None
+
+        _vmap_increment_nesting = torch._functorch.predispatch._vmap_increment_nesting(9, 'error');  _vmap_increment_nesting = None
+
+        _add_batch_dim: "f32[3, 3]" = torch._functorch.predispatch._add_batch_dim(basis, 0, 1);  basis = None
+
+        _autograd_grad = torch._functorch.eager_transforms._autograd_grad([primals_out], [diff_primals], [_add_batch_dim], retain_graph = True, create_graph = True);  primals_out = diff_primals = _add_batch_dim = None
+        batched_outputs: "f32[3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
+        chunked_result: "f32[9, 3, 3]" = torch._functorch.predispatch._remove_batch_dim(batched_outputs, 1, 9, 0);  batched_outputs = None
+
+        _vmap_decrement_nesting = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting = None
+
+        split = chunked_result.split((9,), dim = 0);  chunked_result = None
+        split_1: "f32[9, 3, 3]" = split[0];  split = None
+
+        output_input: "f32[3, 3, 3, 3]" = split_1.view((3, 3, 3, 3));  split_1 = None
+        return (output_input,)
+""",  # NOQA: B950
+        )
+
+        d = {}
+        exec(first_graph, globals(), d)
+        retraced = torch.compile(d["GraphModule"], backend=eager, fullgraph=True)
+        retraced_out = retraced()(x)[0]
+        self.assertEqual(y, retraced_out)
+        retraced_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertEqual(first_graph, retraced_graph)
+
+    def test_retrace_jacfwd(self):
+        # Recompile trick doesn't work with dynamic shapes
+        if check_dynamic_shape_capture():
+            return
+
+        def fn(x):
+            return x.sin()
+
+        def wrapper_fn(x):
+            return torch.func.jacfwd(fn)(x)
+
+        x = torch.randn(3, 3)
+        eager = EagerAndRecordGraphs()
+        opt_f = torch.compile(wrapper_fn, backend=eager, fullgraph=True)
+        y = wrapper_fn(x)
+        opt_y = opt_f(x)
+        self.assertEqual(y, opt_y)
+        first_graph = normalize_gm(eager.graphs[0].print_readable(False))
+        self.assertExpectedInline(
+            first_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[3, 3]"):
+        l_x_ = L_x_
+
+        tensor: "i64[1]" = torch.tensor((9,))
+        cumsum: "i64[1]" = tensor.cumsum(dim = 0);  tensor = None
+        getitem: "i64[0]" = cumsum[slice(None, -1, None)];  cumsum = None
+        neg: "i64[0]" = getitem.neg();  getitem = None
+        unbind = neg.unbind();  neg = unbind = None
+
+        chunk: "f32[9, 9]" = l_x_.new_zeros(9, 9)
+
+        diagonal: "f32[9]" = chunk.diagonal(0)
+        fill_: "f32[9]" = diagonal.fill_(1);  diagonal = fill_ = None
+
+        child: "f32[9, 3, 3]" = chunk.view(9, 3, 3);  chunk = None
+
+        lazy_load_decompositions = torch._functorch.predispatch.lazy_load_decompositions();  lazy_load_decompositions = None
+
+        _vmap_increment_nesting = torch._functorch.predispatch._vmap_increment_nesting(9, 'error');  _vmap_increment_nesting = None
+
+        child_1: "f32[3, 3]" = torch._functorch.predispatch._add_batch_dim(child, 0, 1);  child = None
+
+        _jvp_increment_nesting = torch._C._functorch._jvp_increment_nesting();  _jvp_increment_nesting = None
+        _set_fwd_grad_enabled = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled = None
+        _enter_dual_level = torch._C._enter_dual_level();  _enter_dual_level = None
+
+        _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
+
+        _make_dual: "f32[3, 3]" = torch._make_dual(l_x_, child_1, level = 0);  child_1 = None
+
+        _wrap_for_grad: "f32[3, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
+
+        result_duals: "f32[3, 3]" = _make_dual.sin();  _make_dual = None
+
+        _unpack_dual = torch._unpack_dual(result_duals, level = 0);  result_duals = None
+        primal: "f32[3, 3]" = _unpack_dual[0]
+        dual: "f32[3, 3]" = _unpack_dual[1];  _unpack_dual = None
+
+        primals_out_unflatten: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(primal, 2);  primal = primals_out_unflatten = None
+        tangents_out_unflatten: "f32[3, 3]" = torch._C._functorch._unwrap_for_grad(dual, 2);  dual = None
+
+        _exit_dual_level = torch._C._exit_dual_level(0);  _exit_dual_level = None
+        _set_fwd_grad_enabled_1 = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled_1 = None
+        _jvp_decrement_nesting = torch._C._functorch._jvp_decrement_nesting();  _jvp_decrement_nesting = None
+
+        results: "f32[9, 3, 3]" = torch._functorch.predispatch._remove_batch_dim(tangents_out_unflatten, 1, 9, 0);  tangents_out_unflatten = None
+
+        _vmap_decrement_nesting = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting = None
+
+        movedim: "f32[3, 3, 9]" = results.movedim(0, -1);  results = None
+        split = movedim.split((9,), dim = -1);  movedim = None
+        jac_out_in: "f32[3, 3, 9]" = split[0];  split = None
+
+        unflatten: "f32[3, 3, 3, 3]" = jac_out_in.unflatten(-1, (3, 3));  jac_out_in = None
+        return (unflatten,)
 """,  # NOQA: B950
         )
 
