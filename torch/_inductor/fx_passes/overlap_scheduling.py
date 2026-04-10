@@ -1741,6 +1741,8 @@ def schedule_overlap_bucketing(
     prioritize_bucketing_during_scheduling: bool = True,
     max_off_bucket_gb: float | None = 0.5,
     bucket_mode: BucketMode = "default",
+    pre_bucketing_fsdp_collectives: bool = True,
+    pre_bucketing_fsdp_collectives_bucket_cap_mb: float | None = None,
 ) -> torch.fx.GraphModule:
     """Schedule nodes to maximize compute-collective overlap.
 
@@ -1767,9 +1769,24 @@ def schedule_overlap_bucketing(
         max_memory_increase_ratio: Maximum increase as ratio of baseline peak memory. If None, no ratio limit.
             Uses minimum of absolute and ratio limits when both are specified.
         enable_fusion_regions: Enable fusion region detection and cost estimation for fusible ops.
+        bucket_mode: Bucket mode for collective bucketing. "default" uses plain torch.cat
+            (visible to Inductor), "custom_ops"/"custom_ops_multidtype" use opaque custom ops.
+        pre_bucketing_fsdp_collectives: Pre-bucket FSDP collectives into bandwidth-saturating
+            buckets before overlap scheduling.
+        pre_bucketing_fsdp_collectives_bucket_cap_mb: Override bucket cap in MB for pre-bucketing.
+            When None, auto-computes based on NCCL bandwidth model.
     """
     if not any(is_wait_tensor(n) for n in gm.graph.nodes):
         return gm
+
+    if pre_bucketing_fsdp_collectives:
+        from torch._inductor.fx_passes.fsdp import pre_bucket_fsdp_collectives
+
+        pre_bucket_fsdp_collectives(
+            gm,
+            mode=bucket_mode,
+            bucket_cap_mb=pre_bucketing_fsdp_collectives_bucket_cap_mb,
+        )
 
     trace_structured(
         "artifact",
@@ -1846,6 +1863,8 @@ def schedule_overlap_bucketing_from_inductor_configs(
         "enable_fusion_regions",
         "prioritize_bucketing_during_scheduling",
         "bucket_mode",
+        "pre_bucketing_fsdp_collectives",
+        "pre_bucketing_fsdp_collectives_bucket_cap_mb",
     )
     for key in config_keys:
         if (val := getattr(dist_opts, key, None)) is not None:

@@ -1541,5 +1541,717 @@ class TestForeachGroupsUnit(InductorTestCase):
         self.assertTrue(torch.allclose(result_with, result_without))
 
 
+def _make_pge_trace(
+    collectives=None,
+    matmuls=None,
+    sdpa_ops=None,
+    pg_config=None,
+):
+    """Build a minimal Chrome Trace JSON dict for PGE testing."""
+    events = []
+    eid = 1000
+
+    for coll in collectives or []:
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": coll["dur"],
+                "name": "nccl_kernel",
+                "args": {
+                    "Collective name": coll["name"],
+                    "Process Group Name": coll.get("pg_name", "0"),
+                    "Process Group Ranks": coll.get("ranks", "[0, 1]"),
+                    "Group size": coll.get("group_size", 2),
+                    "In msg nelems": coll.get("nelems", 1024),
+                    "Out msg nelems": coll.get("out_nelems", coll.get("nelems", 1024)),
+                    "dtype": coll.get("dtype", "Float"),
+                },
+            }
+        )
+
+    for mm in matmuls or []:
+        eid += 1
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": "aten::mm",
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": mm["shapes"],
+                    "Input type": mm.get("dtypes", ["Float", "Float"]),
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": mm["dur"],
+                "name": "sm80_xmma_gemm",
+                "args": {"External id": eid},
+            }
+        )
+
+    for sdpa in sdpa_ops or []:
+        eid += 1
+        op_name = sdpa.get("op_name", "aten::_scaled_dot_product_flash_attention")
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": op_name,
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": sdpa["input_dims"],
+                    "Input type": sdpa.get("dtypes", ["BFloat16"]),
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": sdpa["dur"],
+                "name": "flash_fwd_kernel",
+                "args": {"External id": eid},
+            }
+        )
+
+    dist_info = {}
+    if pg_config is not None:
+        dist_info["pg_config"] = pg_config
+    else:
+        dist_info["pg_config"] = {"0": {"ranks": [0, 1]}}
+
+    return {"traceEvents": events, "distributedInfo": dist_info}
+
+
+def _load_pge_profile(data):
+    """Write trace dict to a temp file and load via ProfileData."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        f.flush()
+        path = f.name
+    try:
+        profile = ProfileData()
+        profile.load(path)
+        return profile
+    finally:
+        os.unlink(path)
+
+
+class TestProfileGuidedEstimation(TestCase):
+    def test_collective_lookup_and_interpolation(self):
+        """Parse collectives, exact lookup, interpolation, stride fallback, name normalization, edge cases."""
+        # _rank_stride
+        self.assertEqual(_rank_stride((0, 2, 4, 6)), 2)
+        self.assertEqual(_rank_stride((0, 1, 2, 3)), 1)
+        self.assertIsNone(_rank_stride((0, 1, 4, 5)))
+        self.assertIsNone(_rank_stride((0,)))
+        self.assertIsNone(_rank_stride(()))
+
+        # Collective name normalization
+        norm = ProfileData._normalize_collective_name
+        self.assertEqual(norm("_allgather_base"), "all_gather")
+        self.assertEqual(norm("allreduce"), "all_reduce")
+        self.assertEqual(norm("reduce_scatter_tensor_coalesced"), "reduce_scatter")
+        self.assertEqual(norm("all_to_all_single"), "all_to_all")
+        self.assertEqual(norm("barrier"), "barrier")
+
+        # Load trace with two data points for interpolation + stride fallback
+        trace = _make_pge_trace(
+            collectives=[
+                {
+                    "name": "allreduce",
+                    "dur": 100.0,
+                    "nelems": 1000,
+                    "dtype": "Float",
+                    "ranks": "[0, 2, 4, 6]",
+                    "group_size": 4,
+                },
+                {
+                    "name": "allreduce",
+                    "dur": 800.0,
+                    "nelems": 8000,
+                    "dtype": "Float",
+                    "ranks": "[0, 2, 4, 6]",
+                    "group_size": 4,
+                },
+            ],
+            pg_config={"0": {"ranks": [0, 2, 4, 6]}},
+        )
+        profile = _load_pge_profile(trace)
+        _normalize_profile_indices(profile)
+
+        self.assertEqual(len(profile.collectives), 2)
+
+        # Exact match: 100 us -> 0.1 ms
+        result = profile.lookup_collective("all_reduce", (0, 2, 4, 6), 1000, "Float")
+        self.assertAlmostEqual(result, 0.1, places=4)
+
+        # Interpolation between 1000 and 8000 nelems
+        result = profile.lookup_collective("all_reduce", (0, 2, 4, 6), 4000, "Float")
+        self.assertIsNotNone(result)
+        self.assertGreater(result, 0.1)
+        self.assertLess(result, 0.8)
+
+        # Stride fallback: different ranks, same stride=2 size=4
+        result = profile.lookup_collective("all_reduce", (1, 3, 5, 7), 1000, "Float")
+        self.assertAlmostEqual(result, 0.1, places=4)
+
+        # Miss: wrong collective name
+        self.assertIsNone(
+            profile.lookup_collective("all_to_all", (0, 2, 4, 6), 1000, "Float")
+        )
+
+        # Zero-duration events skipped
+        trace_zero = _make_pge_trace(
+            collectives=[
+                {"name": "allreduce", "dur": 0.0, "nelems": 1024, "dtype": "Float"}
+            ]
+        )
+        self.assertEqual(len(_load_pge_profile(trace_zero).collectives), 0)
+
+        # Empty trace
+        empty = _load_pge_profile({"traceEvents": []})
+        self.assertEqual(len(empty.collectives), 0)
+        self.assertEqual(len(empty.matmuls), 0)
+
+    def test_matmul_and_sdpa_lookup(self):
+        """Matmul and SDPA: exact match, FLOP-ratio interpolation, backward, dtype miss."""
+        trace = _make_pge_trace(
+            matmuls=[
+                {
+                    "shapes": [[128, 256], [256, 512]],
+                    "dur": 50.0,
+                    "dtypes": ["Float", "Float"],
+                },
+                {
+                    "shapes": [[64, 128], [128, 64]],
+                    "dur": 10.0,
+                    "dtypes": ["Float", "Float"],
+                },
+            ],
+            sdpa_ops=[
+                {
+                    "input_dims": [[2, 8, 1024, 64]],
+                    "dur": 300.0,
+                    "dtypes": ["BFloat16"],
+                },
+                {
+                    "input_dims": [[2, 8, 512, 64]],
+                    "dur": 100.0,
+                    "dtypes": ["BFloat16"],
+                },
+                {
+                    "input_dims": [[2, 8, 1024, 64]],
+                    "dur": 500.0,
+                    "dtypes": ["BFloat16"],
+                    "op_name": "aten::_scaled_dot_product_flash_attention_backward",
+                },
+            ],
+        )
+        profile = _load_pge_profile(trace)
+        _normalize_profile_indices(profile)
+
+        # Matmul exact match: 50 us -> 0.05 ms
+        self.assertAlmostEqual(
+            profile.lookup_mm(((128, 256), (256, 512)), "Float"), 0.05, places=4
+        )
+
+        # Matmul FLOP-ratio interpolation
+        result = profile.lookup_mm(((128, 128), (128, 128)), "Float")
+        self.assertIsNotNone(result)
+        ref_flops = 2 * 64 * 64 * 128
+        target_flops = 2 * 128 * 128 * 128
+        self.assertAlmostEqual(
+            result, 10.0 * (target_flops / ref_flops) / 1e3, places=4
+        )
+
+        # Matmul dtype miss
+        self.assertIsNone(profile.lookup_mm(((128, 256), (256, 512)), "Half"))
+
+        # SDPA exact match: 300 us -> 0.3 ms
+        self.assertAlmostEqual(
+            profile.lookup_sdpa(2, 8, 1024, 64, "BFloat16", is_backward=False),
+            0.3,
+            places=4,
+        )
+
+        # SDPA interpolation from 512 data point to a new shape
+        result = profile.lookup_sdpa(2, 8, 2048, 64, "BFloat16", is_backward=False)
+        self.assertIsNotNone(result)
+        self.assertGreater(result, 0.3)
+
+        # SDPA backward
+        self.assertAlmostEqual(
+            profile.lookup_sdpa(2, 8, 1024, 64, "BFloat16", is_backward=True),
+            0.5,
+            places=4,
+        )
+
+    def test_dtype_normalization_and_collision(self):
+        """Dtype normalization, c10:: prefix handling, and collision averaging for matmul/SDPA."""
+        self.assertEqual(_normalize_profile_dtype("c10::Float"), "Float")
+        self.assertEqual(_normalize_profile_dtype("c10::BFloat16"), "BFloat16")
+        self.assertEqual(_normalize_profile_dtype("Float"), "Float")
+        self.assertEqual(_normalize_profile_dtype("CustomType"), "CustomType")
+
+        # Matmul dtype collision: two raw dtypes normalize to same key -> averaged
+        profile = ProfileData()
+        profile._matmul_index = {
+            ((128, 256), (256, 512), "c10::BFloat16"): 100.0,
+            ((128, 256), (256, 512), "BFloat16"): 200.0,
+        }
+        _normalize_profile_indices(profile)
+        key = ((128, 256), (256, 512), "BFloat16")
+        self.assertIn(key, profile._matmul_index)
+        self.assertAlmostEqual(profile._matmul_index[key], 150.0)
+
+        # SDPA dtype collision
+        profile2 = ProfileData()
+        profile2._sdpa_index = {
+            (2, 8, 1024, 64, "c10::BFloat16", False): 100.0,
+            (2, 8, 1024, 64, "BFloat16", False): 300.0,
+        }
+        _normalize_profile_indices(profile2)
+        key2 = (2, 8, 1024, 64, "BFloat16", False)
+        self.assertIn(key2, profile2._sdpa_index)
+        self.assertAlmostEqual(profile2._sdpa_index[key2], 200.0)
+
+        # PG config parsing: dict format
+        trace = _make_pge_trace(
+            pg_config={"0": {"ranks": [0, 1, 2, 3]}, "1": {"ranks": [0, 2]}},
+        )
+        profile3 = _load_pge_profile(trace)
+        self.assertEqual(profile3.pg_configs["0"], (0, 1, 2, 3))
+        self.assertEqual(profile3.pg_configs["1"], (0, 2))
+
+        # PG config parsing: list format
+        trace_list = {
+            "traceEvents": [],
+            "distributedInfo": {
+                "pg_config": [{"pg_name": "default", "ranks": [0, 1, 2, 3]}]
+            },
+        }
+        profile4 = _load_pge_profile(trace_list)
+        self.assertEqual(profile4.pg_configs["default"], (0, 1, 2, 3))
+
+
+@requires_accelerator_dist_backend(["nccl", "xccl"])
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+class TestCoalescedCollectiveOverlap(InductorTestCase):
+    """
+    Tests for coalesced collective support in overlap scheduling.
+
+    Coalesced collectives (e.g., reduce_scatter_tensor_coalesced) return
+    Tensor[] instead of Tensor. Wait nodes follow the pattern:
+      wait_tensor(getitem(coalesced_collective, idx))
+    Multiple waits share the same collective start node.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=8, store=store)
+        cls.device = "cuda"
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        dist.destroy_process_group()
+
+    def _make_coalesced_rs_graph(self, num_tensors=3):
+        """Create an FX graph with a coalesced reduce_scatter and surrounding compute."""
+        group_name = dist.distributed_c10d._get_default_group().group_name
+
+        def func(*inputs):
+            # Compute before collective
+            mm1 = torch.mm(inputs[0], inputs[0])
+
+            # Coalesced reduce_scatter
+            flat_inputs = [x.view(-1) for x in inputs]
+            rs_outs = torch.ops._c10d_functional.reduce_scatter_tensor_coalesced(
+                flat_inputs, "sum", 8, group_name
+            )
+
+            # Wait on each output
+            waited = [torch.ops._c10d_functional.wait_tensor(o) for o in rs_outs]
+
+            # Compute after collective
+            mm2 = torch.mm(inputs[0], inputs[0])
+
+            return mm1.sum() + mm2.sum() + sum(w.sum() for w in waited)
+
+        with FakeTensorMode():
+            inputs = [torch.ones(8, 8, device=self.device) for _ in range(num_tensors)]
+            traced = make_fx(func)(*inputs)
+
+        return traced
+
+    def test_identify_collectives_coalesced(self):
+        """
+        _identify_collectives should register one CollectiveInfo per coalesced
+        collective, not overwrite for each wait.
+        """
+        from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
+
+        traced = self._make_coalesced_rs_graph(num_tensors=3)
+
+        def custom_runtime(node, override_size):
+            if "reduce_scatter" in str(node.target):
+                return 5.0
+            return 0.1
+
+        scheduler = OverlapScheduler(
+            traced,
+            max_in_flight_gb=5.0,
+            max_compute_pre_fetch=200,
+            collective_bucketing=False,
+            insert_overlap_deps=False,
+            compute_overlap_multipler=1.0,
+            max_coll_distance=200,
+            custom_runtime_estimation=custom_runtime,
+            collective_estimator="analytical",
+        )
+
+        # Should have exactly 1 collective (the coalesced RS), not 3
+        self.assertEqual(len(scheduler.collective_info), 1)
+        # All 3 waits should map to the same start
+        self.assertEqual(len(scheduler.wait_to_start), 3)
+        starts = set(scheduler.wait_to_start.values())
+        self.assertEqual(len(starts), 1)
+
+    def test_overlap_scheduler_coalesced_runs(self):
+        """
+        Full overlap scheduler run with coalesced collectives should not crash.
+        Previously crashed with assertion errors in _handle_wait and
+        normalize_function failures in comm_analysis.
+        """
+        from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
+
+        traced = self._make_coalesced_rs_graph(num_tensors=4)
+
+        def custom_runtime(node, override_size):
+            if "reduce_scatter" in str(node.target):
+                return 5.0
+            return 0.1
+
+        result = OverlapScheduler(
+            traced,
+            max_in_flight_gb=5.0,
+            max_compute_pre_fetch=200,
+            collective_bucketing=False,
+            insert_overlap_deps=False,
+            compute_overlap_multipler=1.0,
+            max_coll_distance=200,
+            custom_runtime_estimation=custom_runtime,
+            collective_estimator="analytical",
+        ).run()
+
+        # Graph should still contain the coalesced collective and waits
+        graph_str = str(result.graph)
+        self.assertIn("reduce_scatter_tensor_coalesced", graph_str)
+        self.assertIn("wait_tensor", graph_str)
+
+    def test_gather_node_runtime_estimations_coalesced(self):
+        """
+        gather_node_runtime_estimations should estimate coalesced collectives
+        exactly once (not once per wait).
+        """
+        from torch._inductor.fx_passes.overlap_scheduling import (
+            gather_node_runtime_estimations,
+        )
+
+        traced = self._make_coalesced_rs_graph(num_tensors=3)
+
+        def custom_runtime(node, override_size):
+            if "reduce_scatter" in str(node.target):
+                return 5.0
+            return None
+
+        estimations, _ = gather_node_runtime_estimations(
+            traced,
+            custom_runtime_estimation=custom_runtime,
+            collective_estimator="analytical",
+        )
+
+        # The coalesced RS node should appear exactly once in estimations
+        rs_estimations = {
+            k: v for k, v in estimations.items()
+            if "reduce_scatter" in str(k.target)
+        }
+        self.assertEqual(len(rs_estimations), 1)
+
+    def test_estimate_fx_collective_size_coalesced(self):
+        """
+        estimate_fx_collective_size should handle coalesced collectives
+        whose output meta is a list of tensors, not a single tensor.
+        """
+        from torch._inductor.comm_analysis import estimate_fx_collective_size
+
+        traced = self._make_coalesced_rs_graph(num_tensors=2)
+
+        rs_nodes = traced.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.reduce_scatter_tensor_coalesced.default,
+        )
+        self.assertEqual(len(rs_nodes), 1)
+        size = estimate_fx_collective_size(rs_nodes[0])
+        # Should return non-zero for coalesced collectives
+        self.assertGreater(size, 0)
+
+
+@requires_accelerator_dist_backend()
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+class TestPreBucketingFsdpCollectives(InductorTestCase):
+    """Tests for pre_bucket_fsdp_collectives pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=64, store=store)
+        cls.device = "cuda"
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        dist.destroy_process_group()
+
+    def _make_fsdp_and_tp_graph(self):
+        """Create a graph with FSDP-like and TP-like all_gathers.
+
+        FSDP all_gathers: placeholder -> all_gather (single-input chain to placeholder)
+        TP all_gathers: placeholder + placeholder -> add -> all_gather (multi-input)
+        """
+        fsdp_group = dist.distributed_c10d._get_default_group().group_name
+        # TP group — just use a different name. Real TP would have a separate PG.
+        tp_group = "tp_test_group"
+
+        def func(fsdp_param1, fsdp_param2, tp_act1, tp_act2):
+            # FSDP all_gathers: directly from graph inputs (placeholders)
+            fsdp_ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                fsdp_param1, 64, fsdp_group
+            )
+            fsdp_ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                fsdp_param2, 64, fsdp_group
+            )
+            fsdp_w1 = torch.ops._c10d_functional.wait_tensor(fsdp_ag1)
+            fsdp_w2 = torch.ops._c10d_functional.wait_tensor(fsdp_ag2)
+
+            # FSDP reduce_scatters: output goes directly to graph output
+            fsdp_rs1 = torch.ops._c10d_functional.reduce_scatter_tensor(
+                fsdp_w1, "sum", 64, fsdp_group
+            )
+            fsdp_rs2 = torch.ops._c10d_functional.reduce_scatter_tensor(
+                fsdp_w2, "sum", 64, fsdp_group
+            )
+            fsdp_rw1 = torch.ops._c10d_functional.wait_tensor(fsdp_rs1)
+            fsdp_rw2 = torch.ops._c10d_functional.wait_tensor(fsdp_rs2)
+
+            # TP all_gather: depends on multi-input computation (not single placeholder)
+            tp_combined = tp_act1 + tp_act2  # multi-input → not FSDP
+            tp_ag = torch.ops._c10d_functional.all_gather_into_tensor(
+                tp_combined, 8, tp_group
+            )
+            tp_w = torch.ops._c10d_functional.wait_tensor(tp_ag)
+
+            # TP reduce_scatter: output feeds into further compute (not graph output)
+            tp_rs = torch.ops._c10d_functional.reduce_scatter_tensor(
+                tp_w, "sum", 8, tp_group
+            )
+            tp_rw = torch.ops._c10d_functional.wait_tensor(tp_rs)
+            tp_result = tp_rw + fsdp_rw1  # TP RS feeds into compute
+
+            return fsdp_rw1, fsdp_rw2, tp_result
+
+        with FakeTensorMode():
+            fsdp_p1 = torch.ones(4, 4, device=self.device)
+            fsdp_p2 = torch.ones(4, 4, device=self.device) * 2
+            tp_a1 = torch.ones(4, 4, device=self.device)
+            tp_a2 = torch.ones(4, 4, device=self.device) * 3
+            traced = make_fx(func)(fsdp_p1, fsdp_p2, tp_a1, tp_a2)
+
+        return traced, fsdp_group, tp_group
+
+    def test_identify_fsdp_group_names(self):
+        """Verify that FSDP groups are identified and TP groups are not."""
+        from torch._inductor.fx_passes.fsdp import identify_fsdp_group_names
+
+        traced, fsdp_group, tp_group = self._make_fsdp_and_tp_graph()
+        fsdp_groups = identify_fsdp_group_names(traced)
+
+        self.assertIn(fsdp_group, fsdp_groups)
+        self.assertNotIn(tp_group, fsdp_groups)
+
+    def test_pre_bucketing_only_fsdp(self):
+        """Verify pre_bucket_fsdp_collectives merges only FSDP collectives."""
+        from torch._inductor.fx_passes.bucketing import (
+            is_all_gather_into_tensor,
+            is_reduce_scatter_tensor,
+        )
+        from torch._inductor.fx_passes.fsdp import (
+            _get_group_name,
+            pre_bucket_fsdp_collectives,
+        )
+
+        traced, fsdp_group, tp_group = self._make_fsdp_and_tp_graph()
+
+        # Count collectives before
+        fsdp_ag_before = sum(
+            1
+            for n in traced.graph.nodes
+            if is_all_gather_into_tensor(n) and _get_group_name(n) == fsdp_group
+        )
+        tp_ag_before = sum(
+            1
+            for n in traced.graph.nodes
+            if is_all_gather_into_tensor(n) and _get_group_name(n) == tp_group
+        )
+        fsdp_rs_before = sum(
+            1
+            for n in traced.graph.nodes
+            if is_reduce_scatter_tensor(n) and _get_group_name(n) == fsdp_group
+        )
+        tp_rs_before = sum(
+            1
+            for n in traced.graph.nodes
+            if is_reduce_scatter_tensor(n) and _get_group_name(n) == tp_group
+        )
+
+        self.assertEqual(fsdp_ag_before, 2)
+        self.assertEqual(tp_ag_before, 1)
+        self.assertEqual(fsdp_rs_before, 2)
+        self.assertEqual(tp_rs_before, 1)
+
+        # Run pre-bucketing with a large cap to ensure everything gets merged
+        pre_bucket_fsdp_collectives(traced, mode="default", bucket_cap_mb=2000.0)
+
+        # Count after: FSDP collectives should be merged (2 → 1 each)
+        fsdp_ag_after = sum(
+            1
+            for n in traced.graph.nodes
+            if is_all_gather_into_tensor(n) and _get_group_name(n) == fsdp_group
+        )
+        tp_ag_after = sum(
+            1
+            for n in traced.graph.nodes
+            if is_all_gather_into_tensor(n) and _get_group_name(n) == tp_group
+        )
+        fsdp_rs_after = sum(
+            1
+            for n in traced.graph.nodes
+            if is_reduce_scatter_tensor(n) and _get_group_name(n) == fsdp_group
+        )
+        tp_rs_after = sum(
+            1
+            for n in traced.graph.nodes
+            if is_reduce_scatter_tensor(n) and _get_group_name(n) == tp_group
+        )
+
+        # FSDP should be bucketed (2 merged into 1)
+        self.assertLess(fsdp_ag_after, fsdp_ag_before)
+        # TP should be untouched
+        self.assertEqual(tp_ag_after, tp_ag_before)
+        self.assertEqual(tp_rs_after, tp_rs_before)
+
+    def test_pre_bucketing_config_disabled(self):
+        """Verify pre_bucketing_fsdp_collectives=False skips the pass."""
+        from torch._inductor.fx_passes.bucketing import is_all_gather_into_tensor
+        from torch._inductor.fx_passes.fsdp import pre_bucket_fsdp_collectives
+
+        traced, fsdp_group, _tp_group = self._make_fsdp_and_tp_graph()
+
+        ag_before = sum(
+            1 for n in traced.graph.nodes if is_all_gather_into_tensor(n)
+        )
+        self.assertEqual(ag_before, 3)  # 2 FSDP + 1 TP
+
+        # Verify the config exists and defaults to True
+        from torch._inductor import config
+
+        self.assertTrue(config.aten_distributed_optimizations.pre_bucketing_fsdp_collectives)
+
+        # Call pre_bucket_fsdp_collectives on a fresh graph and verify it works
+        pre_bucket_fsdp_collectives(traced, mode="default", bucket_cap_mb=2000.0)
+
+        ag_after = sum(
+            1 for n in traced.graph.nodes if is_all_gather_into_tensor(n)
+        )
+        # FSDP should be bucketed (2 → 1), TP unchanged (1)
+        self.assertLess(ag_after, ag_before)
+
+    def test_compute_min_saturation_bytes(self):
+        """Verify bandwidth saturation computation gives reasonable values."""
+        from torch._inductor.comm_analysis import (
+            compute_min_saturation_bytes,
+            NCCL_COLL,
+        )
+
+        # Inter-node (64 GPUs = 8 nodes)
+        min_bytes_inter = compute_min_saturation_bytes(
+            64, NCCL_COLL.ALL_GATHER, target_efficiency=0.9
+        )
+        # Should be in a reasonable range (MB scale)
+        self.assertGreater(min_bytes_inter, 1024 * 1024)  # > 1 MB
+        self.assertLess(min_bytes_inter, 1024 * 1024 * 1024)  # < 1 GB
+
+        # Intra-node (8 GPUs = 1 node)
+        min_bytes_intra = compute_min_saturation_bytes(
+            8, NCCL_COLL.ALL_GATHER, target_efficiency=0.9
+        )
+        self.assertGreater(min_bytes_intra, 0)
+        self.assertLess(min_bytes_intra, 1024 * 1024 * 1024)  # < 1 GB
+
+        # Single GPU should return 0
+        self.assertEqual(
+            compute_min_saturation_bytes(1, NCCL_COLL.ALL_GATHER), 0
+        )
+
+    def test_compute_pre_bucket_cap_mb(self):
+        """Verify auto-computed bucket cap is in sensible range."""
+        from torch._inductor.fx_passes.fsdp import compute_pre_bucket_cap_mb
+
+        # Override should pass through
+        self.assertEqual(compute_pre_bucket_cap_mb(64, bucket_cap_mb_override=500.0), 500.0)
+
+        # Auto-compute with defaults (target=0.95, safety=3x, floor=25)
+        # nsys-calibrated: 3x on H100 NVLink gives ~95 MB (77.5% real peak at 80 MB)
+        cap = compute_pre_bucket_cap_mb(64)
+        self.assertGreaterEqual(cap, 25.0)  # at least the floor
+        self.assertLessEqual(cap, 2000.0)
+
+        # Intra-node: 3x safety on 32 MB analytical → ~95 MB
+        cap_intra = compute_pre_bucket_cap_mb(8)
+        self.assertGreaterEqual(cap_intra, 25.0)
+        self.assertLessEqual(cap_intra, 2000.0)
+        self.assertGreater(cap_intra, 50.0)
+
+        # Inter-node: analytical model gives smaller caps, floor catches
+        cap_128 = compute_pre_bucket_cap_mb(128)
+        self.assertGreaterEqual(cap_128, 25.0)
+
+    @torch._inductor.config.patch(
+        {
+            "aten_distributed_optimizations.pre_bucketing_fsdp_collectives_target_efficiency": 0.9,
+            "aten_distributed_optimizations.pre_bucketing_fsdp_collectives_safety_multiplier": 1.0,
+            "aten_distributed_optimizations.pre_bucketing_fsdp_collectives_min_bucket_cap_mb": 10.0,
+        }
+    )
+    def test_compute_pre_bucket_cap_mb_sweep_configs(self):
+        """Verify sweep configs affect bucket cap computation."""
+        from torch._inductor.fx_passes.fsdp import compute_pre_bucket_cap_mb
+
+        # With safety=1.0 and target=0.9, cap should be smaller than defaults
+        cap_low = compute_pre_bucket_cap_mb(8)
+        self.assertGreaterEqual(cap_low, 10.0)
+        self.assertLess(cap_low, 50.0)
+
+
 if __name__ == "__main__":
     run_tests()
