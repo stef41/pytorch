@@ -1522,6 +1522,12 @@ class OverlapScheduler:
             self.wasted_compute,
         )
 
+        # Persist overlap annotations for downstream passes (e.g., LC replacement).
+        # A collective "has compute overlap" when some compute was scheduled
+        # between it and its wait, reducing its exposed time.
+        for info in self.collective_info.values():
+            info.start_node.meta["has_compute_overlap"] = not info.is_exposed
+
         self.reorder_graph()
 
     def _bucket_collectives(self) -> None:

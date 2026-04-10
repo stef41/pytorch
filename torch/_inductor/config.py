@@ -1162,6 +1162,27 @@ class aten_distributed_optimizations:
     # fails with a cycle error, and file a bug so the root cause can be fixed.
     overlap_scheduling_autofix_cycles: bool = False
 
+    # Replace NCCL collectives (all_gather, reduce_scatter) with
+    # copy-engine-based symmetric memory low-contention collectives.
+    # Eligible collectives on NVLink-connected groups are replaced with
+    # symm_mem._low_contention_all_gather/_low_contention_reduce_scatter,
+    # which use copy engine P2P instead of SM-based NCCL kernels.
+    enable_low_contention_collectives: bool = False
+
+    # Selective replacement of FSDP collectives with copy-engine variants.
+    #   True:  replace all FSDP collectives (bucketed and standalone).
+    #   False: don't replace any.
+    #   None (auto): replace only collectives hidden behind compute
+    #     (not on the critical path), using overlap annotations from
+    #     overlap_scheduling or independent analysis.
+    # Supersedes enable_low_contention_collectives when set.
+    use_low_contention_collectives_for_fsdp: bool | None = False
+
+    # Implementation for all-gather replacement in low-contention mode.
+    #   "low_contention": copy engine P2P via symm_mem._low_contention_all_gather
+    #   "multimem": NVSwitch multicast via symm_mem._multimem_all_gather
+    low_contention_ag_impl: str = "low_contention"
+
 
 def parallel_compile_enabled_internally() -> bool:
     """

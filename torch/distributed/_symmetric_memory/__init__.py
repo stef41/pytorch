@@ -474,6 +474,8 @@ lib.define("_low_contention_all_gather(Tensor tensor, str group_name) -> Tensor"
 lib.define(
     "_low_contention_reduce_scatter(Tensor tensor, str reduce_op, str group_name) -> Tensor"
 )
+lib.define("_multimem_all_gather(Tensor tensor, str group_name) -> Tensor")
+lib.define("_multimem_all_gather_inplace(Tensor tensor, str group_name) -> Tensor")
 
 lib.define("get_remote_tensors(Tensor x, str group_name) -> Tensor[]")
 """
@@ -1727,6 +1729,77 @@ def _low_contention_all_gather(
         symm_mem.barrier()
         torch._C._distributed_c10d._register_work(output, Work())
         return output
+
+
+@torch.library.impl(lib, "_multimem_all_gather", "Meta")
+def _multimem_all_gather_meta(
+    tensor: torch.Tensor,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    group_size = c10d._get_group_size_by_name(group_name)
+    return tensor.new_empty(tensor.shape[0] * group_size, *tensor.shape[1:])
+
+
+@torch.library.impl(lib, "_multimem_all_gather", "CUDA")
+def _multimem_all_gather(
+    tensor: torch.Tensor,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    """
+    Performs all-gather using multicast store (multimem.st PTX instruction).
+
+    Uses NVSwitch multicast to distribute data to all peers in a single write.
+    Requires multicast support on the device. Uses minimal SMs compared to NCCL.
+    """
+    group = c10d._resolve_process_group(group_name)
+    world_size = group.size()
+    out_shape = torch.Size((tensor.shape[0] * world_size, *tensor.shape[1:]))
+    symm_mem = get_symm_mem_workspace(
+        group_name, out_shape.numel() * tensor.element_size()
+    )
+    out = symm_mem.get_buffer(symm_mem.rank, out_shape, tensor.dtype)
+    output = tensor.new_empty(out_shape)
+
+    _get_backend_stream().wait_stream(torch.cuda.current_stream())
+    with _get_backend_stream():
+        torch.ops.symm_mem.multimem_all_gather_out(tensor, group_name, out)
+        output.copy_(out)
+        torch._C._distributed_c10d._register_work(output, Work())
+        return output
+
+
+@torch.library.impl(lib, "_multimem_all_gather_inplace", "Meta")
+def _multimem_all_gather_inplace_meta(
+    tensor: torch.Tensor,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    group_size = c10d._get_group_size_by_name(group_name)
+    return tensor.new_empty(tensor.shape[0] * group_size, *tensor.shape[1:])
+
+
+@torch.library.impl(lib, "_multimem_all_gather_inplace", "CUDA")
+def _multimem_all_gather_inplace(
+    tensor: torch.Tensor,
+    group_name: c10d.GroupName,
+) -> torch.Tensor:
+    """
+    Like _multimem_all_gather but returns the symm_mem buffer directly
+    (no DtoD copy). Faster but the returned buffer may be reused by
+    subsequent symm_mem operations.
+    """
+    group = c10d._resolve_process_group(group_name)
+    world_size = group.size()
+    out_shape = torch.Size((tensor.shape[0] * world_size, *tensor.shape[1:]))
+    symm_mem = get_symm_mem_workspace(
+        group_name, out_shape.numel() * tensor.element_size()
+    )
+    out = symm_mem.get_buffer(symm_mem.rank, out_shape, tensor.dtype)
+
+    _get_backend_stream().wait_stream(torch.cuda.current_stream())
+    with _get_backend_stream():
+        torch.ops.symm_mem.multimem_all_gather_out(tensor, group_name, out)
+        torch._C._distributed_c10d._register_work(out, Work())
+        return out
 
 
 @torch.library.impl(lib, "_low_contention_reduce_scatter", "Meta")
