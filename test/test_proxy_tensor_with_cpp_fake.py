@@ -11,6 +11,7 @@ Python handler (decomposition, fake_impl, etc.) and calls it. Sub-ops
 re-enter C++ Fake dispatch, so all results remain C++ fake tensors.
 """
 
+from torch.testing import make_tensor
 from torch.testing._internal.common_utils import TestCase, run_tests
 import torch
 import torch._dynamo
@@ -107,11 +108,21 @@ class TestCppFakeProxyTensor(TestCase):
     fake tensor semantics.
     """
 
-    def _test(self, f, inps):
+    def _test(self, f, inps, compare_graph=False):
+        # Trace under C++ fake mode
         with cpp_fake_tensor_mode():
-            fx_f = make_fx(f, tracing_mode="real")(*inps)
+            cpp_gm = make_fx(f, tracing_mode="real")(*inps)
+
+        if compare_graph:
+            # Trace under Python fake mode and compare graph structure
+            py_gm = make_fx(f, tracing_mode="fake")(*inps)
+            cpp_ops = [n.target for n in cpp_gm.graph.nodes if n.op == "call_function"]
+            py_ops = [n.target for n in py_gm.graph.nodes if n.op == "call_function"]
+            self.assertEqual(cpp_ops, py_ops)
+
+        # Verify correctness with real inputs
         new_inps = tree_map(_create_new_input, inps)
-        r1 = fx_f(*new_inps)
+        r1 = cpp_gm(*new_inps)
         r2 = f(*new_inps)
         self.assertEqual(r1, r2)
 
@@ -761,6 +772,66 @@ def forward(self, x_1):
         x = torch.randn(3, device="cuda")
         self.assertEqual(gm(x), f(x))
 
+    # --- Higher Order Op tests ---
+    # These mirror the hop_db entries but call internal ops (cond_op, while_loop_op,
+    # map_impl, scan_op) directly, bypassing the user-facing wrappers that route
+    # through torch.compile/Dynamo.
+
+    def _make_arg(self, *shape, low=0.1, high=2):
+        return make_tensor(*shape, low=low, high=high, dtype=torch.float, device="cpu")
+
+    def test_cond_simple(self):
+        """Mirrors hop_db simple_cond."""
+        from torch._higher_order_ops.cond import cond_op
+
+        def f(x):
+            return cond_op(
+                x.sum() > 2, lambda x: (x.cos(),), lambda x: (x.sin(),), [x]
+            )
+
+        self._test(f, (self._make_arg(2, 2, 2),), compare_graph=True)
+
+    def test_while_loop_simple(self):
+        """Mirrors hop_db simple_while_loop."""
+        from torch._higher_order_ops.while_loop import while_loop_op
+
+        def f(iter_t, x):
+            def cond_fn(iter_t, x):
+                return iter_t > 0
+
+            def body_fn(iter_t, x):
+                return iter_t - 1, x.cos()
+
+            return while_loop_op(cond_fn, body_fn, (iter_t, x), ())
+
+        self._test(f, (torch.tensor(3), self._make_arg(2, 3, 4)), compare_graph=True)
+
+    def test_map_simple(self):
+        """Mirrors hop_db simple_map."""
+        from torch._higher_order_ops.map import map_impl
+
+        def inner_f(x0, x1, y0, y1):
+            return [x0.cos().add_(1.0) * y0, (x1 + y1.sin()).cos_().view(x1.size())]
+
+        def f(x0, x1, y0, y1):
+            return map_impl(inner_f, [x0, x1], (y0, y1))
+
+        self._test(f, (self._make_arg(2, 2, 2), self._make_arg(2, 2, 2),
+                        self._make_arg(1), self._make_arg(1)), compare_graph=True)
+
+    def test_scan_simple(self):
+        """Mirrors hop_db simple_scan."""
+        from torch._higher_order_ops.scan import scan_op
+
+        def combine_fn(carry, x):
+            result = carry @ x + x
+            return result, carry.clone()
+
+        def f(init, xs):
+            return scan_op(combine_fn, [init], [xs], ())
+
+        self._test(f, (self._make_arg(2, 2), self._make_arg(2, 2, 2)), compare_graph=True)
+
 
 # --- OpInfo-based exhaustive tests for C++ FakeTensor mode ---
 
@@ -772,6 +843,7 @@ cpp_fake_make_fx_failures = {
     xfail('equal'),
     # empty
     skip('new_empty'),
+    skip('new_empty_strided'),
     skip('empty_like'),
     skip('empty'),
     skip('empty_permuted'),
@@ -884,7 +956,14 @@ _cpp_fake_decomps = {
     }
 }
 
-filtered_hop_db = [op for op in hop_db if op.name != "auto_functionalize"]
+# HOPs whose user-facing wrappers (torch.cond, etc.) call torch.compile internally,
+# creating a Python FakeTensorMode that conflicts with C++ fake mode.
+# These are tested directly via internal ops in TestCppFakeProxyTensor.
+_HOP_SKIP_USER_FACING = {
+    "cond", "map", "scan", "while_loop", "while_loop_stack_output",
+    "auto_functionalize",
+}
+filtered_hop_db = [op for op in hop_db if op.name not in _HOP_SKIP_USER_FACING]
 
 
 @unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "Cond requires dynamo")
