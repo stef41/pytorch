@@ -1,6 +1,6 @@
 #pragma once
 
-#include <c10/util/fs.h>
+#include <c10/util/FileSystem.h>
 #include <torch/csrc/jit/ir/irparser.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
 #include <torch/csrc/jit/runtime/interpreter.h>
