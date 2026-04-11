@@ -152,6 +152,9 @@ output_code_log = torch._logging.getArtifactLogger(__name__, "output_code")
 autotuning_log = torch._logging.getArtifactLogger(__name__, "autotuning")
 log = logging.getLogger(__name__)
 
+FXGRAPH_CACHE_PREFIX = "c"
+AOTAUTOGRAD_CACHE_PREFIX = "a"
+
 
 def get_cpp_wrapper_cubin_path_name() -> str:
     return "cubin_path" if torch.version.hip is None else "hsaco_path"
@@ -343,7 +346,7 @@ def code_hash(code: str | bytes, extra: str | bytes = "") -> str:
     if extra:
         extra_b = extra if isinstance(extra, bytes) else extra.encode("utf-8")
         hashing_str = hashing_str + b"||" + extra_b
-    return "c" + sha256_hash(hashing_str)
+    return FXGRAPH_CACHE_PREFIX + sha256_hash(hashing_str)
 
 
 def get_path(

@@ -33,6 +33,7 @@ from torch._functorch import config
 from torch._inductor.codecache import (
     _ident,
     add_ephemeral_timeout_increase_for_distributed,
+    AOTAUTOGRAD_CACHE_PREFIX,
     BypassFxGraphCache,
     create_cache,
     extract_tensor_metadata_for_cache_key,
@@ -757,7 +758,7 @@ def autograd_cache_key(
             )
             pickler = AOTAutogradCachePickler(gm)
             # The prefix distinguishes among the other kinds of objects we cache
-            key = "a" + pickler.get_hash(details)
+            key = AOTAUTOGRAD_CACHE_PREFIX + pickler.get_hash(details)
             # debug_lines re-hashes every attribute individually and is
             # expensive. Only compute when debug logging is enabled.
             if log.isEnabledFor(logging.DEBUG):
