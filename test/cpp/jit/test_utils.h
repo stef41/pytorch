@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/util/fs.h>
 #include <torch/csrc/jit/ir/irparser.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
 #include <torch/csrc/jit/runtime/interpreter.h>
@@ -89,10 +90,22 @@ bool exactlyEqual(
     const std::vector<at::Tensor>& a,
     const std::vector<at::Tensor>& b);
 
-// Resolve checked-in test assets relative to the repo root at runtime so
-// installed C++ test binaries do not depend on the original build checkout path.
+// Prefer runtime-staged test assets from the working directory, but keep a
+// source-tree fallback for direct local test_jit invocations from a build dir.
 inline std::string jitTestAsset(const char* filename) {
-  return std::string("test/cpp/jit/") + filename;
+  for (const auto* prefix : {"", "cpp/jit/", "test/cpp/jit/"}) {
+    const auto candidate = std::string(prefix) + filename;
+    if (c10::filesystem::exists(candidate)) {
+      return candidate;
+    }
+  }
+
+  const auto source_tree_asset =
+      (c10::filesystem::path(__FILE__).parent_path() / filename).string();
+  if (c10::filesystem::exists(source_tree_asset)) {
+    return source_tree_asset;
+  }
+  return std::string(filename);
 }
 
 std::vector<at::Tensor> runGraph(
