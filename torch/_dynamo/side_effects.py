@@ -517,7 +517,9 @@ class SideEffects:
             variable_cls = GenericContextWrappingVariable
         elif issubclass(user_cls, torch.nn.Module):
             variable_cls = variables.UnspecializedNNModuleVariable
-        elif issubclass(user_cls, (dict, collections.OrderedDict)):
+        elif issubclass(user_cls, collections.OrderedDict):
+            variable_cls = variables.OrderedDictVariable
+        elif issubclass(user_cls, dict):
             variable_cls = variables.UserDefinedDictVariable
         elif issubclass(user_cls, (set, frozenset)):
             variable_cls = variables.UserDefinedSetVariable

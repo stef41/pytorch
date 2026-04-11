@@ -482,6 +482,8 @@ class ConstDictVariable(VariableTracker):
             tx.output.side_effects.mutation(self)
             self.items.update(temp_dict_vt.items)  # type: ignore[attr-defined]
             return CONSTANT_VARIABLE_NONE
+        elif name == "__len__":
+            return self.mp_length(tx)
         elif name == "__getitem__":
             # Key guarding - Nothing to do. LazyVT for value will take care.
             if len(args) != 1:
@@ -769,12 +771,11 @@ class ConstDictVariable(VariableTracker):
             # defaultdict.
 
             # TODO(guilhermeleobas): this check should be on builtin.py::call_or_
-            if istype(
+            if isinstance(
                 other,
                 (
                     ConstDictVariable,
                     variables.UserDefinedDictVariable,
-                    variables.DefaultDictVariable,
                 ),
             ):
                 # Unwrap UserDefinedDictVariable to its underlying ConstDictVariable
@@ -802,9 +803,10 @@ class ConstDictVariable(VariableTracker):
                 )
 
                 # NB - Guard on all the keys of the other dict to ensure
-                # correctness.
-                args[0].install_dict_keys_match_guard()  # type: ignore[attr-defined]
-                new_dict_vt.items.update(args[0].items)  # type: ignore[attr-defined]
+                # correctness. Use `other` (already unwrapped from
+                # UserDefinedDictVariable to ConstDictVariable above).
+                other.install_dict_keys_match_guard()  # type: ignore[union-attr]
+                new_dict_vt.items.update(other.items)  # type: ignore[union-attr]
                 return new_dict_vt
             else:
                 raise_observed_exception(

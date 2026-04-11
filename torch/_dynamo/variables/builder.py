@@ -297,6 +297,7 @@ from .user_defined import (
     IntWrapperVariable,
     KeyedJaggedTensorVariable,
     MutableMappingVariable,
+    OrderedDictVariable,
     SourcelessGraphModuleVariable,
     UserDefinedClassVariable,
     UserDefinedConstantVariable,
@@ -893,10 +894,16 @@ class VariableBuilder:
                     ),
                     source=self.source,
                 )
+            elif istype(value, collections.OrderedDict):
+                dict_vt = ConstDictVariable(
+                    result,  # type: ignore[arg-type]
+                    user_cls=collections.OrderedDict,
+                    source=self.source,
+                )
+                result = OrderedDictVariable(value, dict_vt=dict_vt, source=self.source)
             else:
                 result = ConstDictVariable(
                     result,  # type: ignore[arg-type]
-                    user_cls=type(value),
                     source=self.source,
                 )
 
@@ -1663,6 +1670,16 @@ class VariableBuilder:
             # Guard on the key order
             self.tx.output.guard_on_key_order.add(self.source)
 
+            # Exact OrderedDict doesn't override __getitem__, so we can use
+            # the faster DictGetItemSource. Subclasses may override it, so
+            # use DictSubclassGetItemSource for safety.
+            is_exact_ordered_dict = type(value) is collections.OrderedDict
+            ValueSourceType = (
+                DictGetItemSource
+                if is_exact_ordered_dict
+                else DictSubclassGetItemSource
+            )
+
             # We need all the keys to be hashable. We do this within the
             # HashableTracker class in hashable.py
             def build_key_value(
@@ -1672,7 +1689,7 @@ class VariableBuilder:
                 source_key = ConstDictKeySource(base, i)
                 key = LazyVariableTracker.create(k, source_key)
 
-                source_value = DictSubclassGetItemSource(base, source_key)
+                source_value = ValueSourceType(base, source_key)
                 res_value = LazyVariableTracker.create(v, source_value)
 
                 return key, res_value
@@ -1686,13 +1703,10 @@ class VariableBuilder:
                 for i, (k, v) in enumerate(get_items_from_dict(value))
             )
 
+            is_ordered_dict = isinstance(value, collections.OrderedDict)
             dict_vt = ConstDictVariable(
                 result,
-                user_cls=(
-                    collections.OrderedDict
-                    if isinstance(value, collections.OrderedDict)
-                    else dict
-                ),
+                user_cls=(collections.OrderedDict if is_ordered_dict else dict),
                 mutation_type=ValueMutationExisting(),
                 source=self.source,
             )
@@ -1700,7 +1714,12 @@ class VariableBuilder:
             # bytecode simple
             dict_vt.should_reconstruct_all = True
 
-            result = UserDefinedDictVariable(value, dict_vt=dict_vt, source=self.source)
+            if isinstance(value, collections.OrderedDict):
+                result = OrderedDictVariable(value, dict_vt=dict_vt, source=self.source)
+            else:
+                result = UserDefinedDictVariable(
+                    value, dict_vt=dict_vt, source=self.source
+                )
             return self.tx.output.side_effects.track_object_existing(value, result)
         elif isinstance(value, tuple):
             self.install_guards(GuardBuilder.TYPE_MATCH)
