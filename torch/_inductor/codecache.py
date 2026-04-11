@@ -154,6 +154,7 @@ log = logging.getLogger(__name__)
 
 FXGRAPH_CACHE_PREFIX = "c"
 AOTAUTOGRAD_CACHE_PREFIX = "a"
+COMPILED_FX_GRAPH_CACHE_PREFIX = "f"
 
 
 def get_cpp_wrapper_cubin_path_name() -> str:
@@ -1118,7 +1119,7 @@ def compiled_fx_graph_hash(
 
     # The prefix distinguishes among the other kinds of objects we
     # cache in this module.
-    key = "f" + pickler.get_hash(details)
+    key = COMPILED_FX_GRAPH_CACHE_PREFIX + pickler.get_hash(details)
     debug_lines = pickler.debug_lines(details)
     debug_str = "\n".join(debug_lines)
     log.debug(f"FX graph cache hash details for key {key}:\n{debug_str}")  # noqa: G004
