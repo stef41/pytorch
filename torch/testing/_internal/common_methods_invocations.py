@@ -21976,10 +21976,8 @@ op_db: list[OpInfo] = [
             # lambda impl
             DecorateInfo(unittest.expectedFailure, 'TestNormalizeOperators', 'test_normalize_operator_exhaustive'),
             # AssertionError: Tensor-likes are not close!
-            # Fails in cuda11.7
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_compare_cpu', device_type='cuda'),
-            # AssertionError: Tensor-likes are not close!
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_compare_cpu', device_type='xpu'),
+            # Fails in cuda11.7 and xpu
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_compare_cpu', device_type=('cuda', 'xpu')),
             DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),),),
     # In training mode, feature_alpha_dropout currently doesn't support inputs of complex dtype
     # unlike when `train=False`, it supports complex inputs, hence 2 OpInfos to cover all cases
@@ -22210,10 +22208,7 @@ op_db: list[OpInfo] = [
         gradcheck_nondet_tol=1e-15,
         skips=(
             # NOTE: Only run on MPS
-            DecorateInfo(unittest.skip('Skipped!'), device_type='cpu'),
-            DecorateInfo(unittest.skip('Skipped!'), device_type='cuda'),
-            DecorateInfo(unittest.skip('Skipped!'), device_type='xpu'),
-            DecorateInfo(unittest.skip('Skipped!'), device_type='meta'),
+            DecorateInfo(unittest.skip('Skipped!'), device_type=('cpu', 'xpu', 'cuda', 'meta')),
             # Error: The operator 'aten::grid_sampler_3d_backward' is not currently implemented for the MPS device.
             DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
             DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_variant_consistency_eager', device_type='mps'),
