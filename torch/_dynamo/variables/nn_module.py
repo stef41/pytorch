@@ -573,6 +573,7 @@ class NNModuleVariable(VariableTracker):
                     variables.UserFunctionVariable(fn, source=fn_source),
                     args,
                     kwargs,
+                    allow_nested_graph_breaks=True,
                 )
 
     def call_method(
@@ -871,6 +872,7 @@ class NNModuleVariable(VariableTracker):
                     variables.UserFunctionVariable(fn, source=src),
                     [self] + list(args),
                     kwargs,
+                    allow_nested_graph_breaks=True,
                 )
 
             if isinstance(args[0], SliceVariable):
