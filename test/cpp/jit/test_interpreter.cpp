@@ -198,10 +198,7 @@ TEST(InterpreterTest, runAsyncBasicTest) {
   demo = DemoModule()
   torch.jit.save(torch.jit.script(demo), 'test_interpreter_async.pt')
   */
-  std::string filePath(__FILE__);
-  auto testModelFile = filePath.substr(0, filePath.find_last_of("/\\") + 1);
-  testModelFile.append("test_interpreter_async.pt");
-  auto model = load(testModelFile);
+  auto model = load(jitTestAsset("test_interpreter_async.pt"));
   auto graph = model.get_method("forward").graph();
   Code function(graph, "");
   auto asyncCounter = 0;

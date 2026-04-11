@@ -26,7 +26,7 @@ from typing import *  # noqa: F403
 # support them correctly.
 
 def to_numpy(tensor):
-    return tensor.cpu().numpy()
+    return tensor.detach().cpu().numpy()
 
 @torch.library.custom_op("_torch_testing::numpy_cube", mutates_args=())
 def numpy_cube(x: Tensor) -> tuple[Tensor, Tensor]:

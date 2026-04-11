@@ -89,6 +89,12 @@ bool exactlyEqual(
     const std::vector<at::Tensor>& a,
     const std::vector<at::Tensor>& b);
 
+// Resolve checked-in test assets relative to the repo root at runtime so
+// installed C++ test binaries do not depend on the original build checkout path.
+inline std::string jitTestAsset(const char* filename) {
+  return std::string("test/cpp/jit/") + filename;
+}
+
 std::vector<at::Tensor> runGraph(
     std::shared_ptr<Graph> graph,
     const std::vector<at::Tensor>& inputs);
