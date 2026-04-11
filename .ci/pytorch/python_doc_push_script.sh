@@ -50,9 +50,17 @@ echo "install_path: $install_path  version: $version"
 
 build_docs () {
   set +e
-  set -o pipefail
-  make "$1" 2>&1 | tee /tmp/docs_build.txt
+  # Don't pipe through tee: sphinx -j auto forks workers that can hold
+  # the pipe fd open after sphinx exits, causing tee to hang forever.
+  # Use tail -f in background for real-time CI output instead.
+  make "$1" > /tmp/docs_build.txt 2>&1 &
+  local make_pid=$!
+  tail -f /tmp/docs_build.txt &
+  local tail_pid=$!
+  wait $make_pid
   code=$?
+  kill $tail_pid 2>/dev/null
+  wait $tail_pid 2>/dev/null
   if [ $code -ne 0 ]; then
     set +x
     echo =========================
@@ -87,7 +95,9 @@ pushd docs
 if [ "$is_main_doc" = true ]; then
   build_docs html || exit $?
 
-  make coverage
+  # Coverage only checks API docs, not notebook outputs. Disable myst-nb
+  # execution to avoid re-running notebooks (which can hang).
+  SPHINXOPTS="${SPHINXOPTS:--j auto -WT --keep-going} -D nb_execution_mode=off" make coverage
   # Now we have the coverage report, we need to make sure it is empty.
   # Sphinx 7.2.6+ format: python.txt contains a statistics table with a TOTAL row
   # showing the undocumented count in the third column.
